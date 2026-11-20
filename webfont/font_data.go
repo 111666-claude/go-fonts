@@ -23,8 +23,10 @@ type Font struct {
 	FontFace     *FontFace     `xml:"font-face"`
 	MissingGlyph *MissingGlyph `xml:"missing-glyph"`
 	Glyphs       []*Glyph      `xml:"glyph"`
+	HKerns       []*HKern      `xml:"hkern"`
 
-	Data string // Used to send protobuf data to text/template.
+	Data     string // Used to send protobuf data to text/template.
+	KernData string // Used to send the serialized kerning table to text/template.
 }
 
 // FontFace represents the <font-face> XML block of the webfont data.
@@ -43,6 +45,7 @@ type MissingGlyph struct {
 type Glyph struct {
 	HorizAdvX float64 `xml:"horiz-adv-x,attr"`
 	Unicode   *string `xml:"unicode,attr,omitempty"`
+	GlyphName *string `xml:"glyph-name,attr,omitempty"`
 	D         *string `xml:"d,attr,omitempty"`
 	DOrig     *string `xml:"d-orig,attr,omitempty"`
 	GerberLP  *string `xml:"gerber-lp,attr,omitempty"`

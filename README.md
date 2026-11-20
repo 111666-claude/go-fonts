@@ -51,6 +51,32 @@ See https://github.com/gmlewis/go-gerber
 or https://github.com/gmlewis/blackjack
 for example applications that use this package.
 
+## Kerning
+
+Fonts converted from SVG webfonts that contain `<hkern>` elements keep
+their horizontal kerning tables in `Font.Kern`. Kerning is opt-in so
+that existing programs render exactly as before:
+
+```go
+// Option A: explicit kerning-aware entry points.
+render, err := fonts.TextKern(xPos, yPos, xScale, yScale, message,
+  "ubuntumonoregular", &fonts.Center, true)
+mbb, err := fonts.TextMBBKern(xPos, yPos, xScale, yScale, message,
+  "ubuntumonoregular", true)
+
+// Option B: flip the switch on the existing TextOpts.
+render, err := fonts.Text(xPos, yPos, xScale, yScale, message,
+  "ubuntumonoregular", &fonts.TextOpts{EnableKerning: true})
+```
+
+When enabled, each glyph's base position is shifted by the adjustment
+of the preceding present-glyph pair; the glyph outlines themselves are
+unchanged. Missing glyphs, tabs and newlines break kerning pairs, so
+an adjustment is never carried over to an unrelated following glyph.
+Fonts without a kerning table, or a disabled switch, use the plain
+advance widths. Non-finite dimensions return an error rather than
+producing NaN geometry.
+
 ----------------------------------------------------------------------
 
 Enjoy!

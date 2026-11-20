@@ -56,6 +56,14 @@ type TextOpts struct {
 	// Rotate rotates the entire message about its anchor point
 	// by this number of radians.
 	Rotate float64
+	// EnableKerning turns on horizontal kerning when rendering.
+	// When false (the zero value, and therefore the default), the
+	// legacy advance-width-only layout is used and the font's
+	// kerning table is never consulted. When true, the adjustment
+	// for each consecutive present-glyph pair is applied to the
+	// following glyph's base position; missing glyphs, newlines and
+	// tabs break the pair so a previous adjustment is never reused.
+	EnableKerning bool
 }
 
 // Pt represents a 2D Point.
@@ -134,12 +142,43 @@ func getFont(fontName string) (*Font, error) {
 
 // TextMBB calculates the minimum bounding box of a text message without
 // the overhead of rendering it.
+//
+// It uses the legacy advance-width-only layout and never consults the
+// font's kerning table, so its results are unchanged from earlier
+// releases. Use TextMBBKern (or Text with TextOpts.EnableKerning) to
+// apply kerning.
 func TextMBB(xPos, yPos, xScale, yScale float64, message, fontName string) (*MBB, error) {
-	font, err := getFont(fontName)
-	if err != nil {
-		return nil, err
-	}
+	return textMBB(xPos, yPos, xScale, yScale, message, fontName, false)
+}
 
+// TextMBBKern calculates the minimum bounding box of a text message
+// without the overhead of rendering it, applying the font's horizontal
+// kerning table when useKerning is true.
+//
+// Kerning adjustments are expressed in native font units and are
+// scaled by xScale together with the advance widths. Fonts without a
+// kerning table produce exactly the same result as TextMBB.
+func TextMBBKern(xPos, yPos, xScale, yScale float64, message, fontName string, useKerning bool) (*MBB, error) {
+	if !finite(xPos) || !finite(yPos) || !finite(xScale) || !finite(yScale) {
+		return nil, errors.New("xPos, yPos, xScale and yScale must be finite")
+	}
+	return textMBB(xPos, yPos, xScale, yScale, message, fontName, useKerning)
+}
+
+// glyphLayout is one rune's position as computed by the layout
+// walker, in native font units and relative to the unaligned text
+// origin (0,0).
+type glyphLayout struct {
+	runeIndex int
+	r         rune
+	x, y      float64
+	present   bool // false for '\n', '\t' and missing glyphs.
+}
+
+// layoutText performs the single source of truth for advance widths
+// and kerning. It returns the per-rune native-unit bases and the
+// native-unit MBB of all present glyphs.
+func layoutText(font *Font, message string, useKerning bool) ([]glyphLayout, *MBB, error) {
 	if font.HorizAdvX == 0 {
 		font.HorizAdvX = font.UnitsPerEm
 	}
@@ -147,15 +186,23 @@ func TextMBB(xPos, yPos, xScale, yScale float64, message, fontName string) (*MBB
 		font.MissingHorizAdvX = font.HorizAdvX
 	}
 
+	var layouts []glyphLayout
 	var result *MBB
 	x, y := 0.0, 0.0
-	for _, c := range message {
+	prevRune := rune(-1) // No previous glyph on the current line.
+	for runeIndex, c := range message {
+		gl := glyphLayout{runeIndex: runeIndex, r: c, x: x, y: y}
+
 		if c == rune('\n') {
+			layouts = append(layouts, gl)
 			x, y = 0.0, y-(font.Ascent-font.Descent)
+			prevRune = -1
 			continue
 		}
 		if c == rune('\t') {
+			layouts = append(layouts, gl)
 			x += 2.0 * font.HorizAdvX
+			prevRune = -1
 			continue
 		}
 		g, ok := font.Glyphs[c]
@@ -163,23 +210,32 @@ func TextMBB(xPos, yPos, xScale, yScale float64, message, fontName string) (*MBB
 			if c != ' ' {
 				log.Printf("Warning: missing glyph %+q: skipping", c)
 			}
+			layouts = append(layouts, gl)
 			x += font.MissingHorizAdvX
+			// A missing glyph cannot pass a kerning adjustment on
+			// to the following glyph.
+			prevRune = -1
 			continue
 		}
-		width := (g.MBB.Max[0] - g.MBB.Min[0])
-		height := (g.MBB.Max[1] - g.MBB.Min[1])
-		minx := x + g.MBB.Min[0]
-		miny := y + g.MBB.Min[1]
+		if useKerning && prevRune >= 0 {
+			x += font.kernValue(prevRune, c)
+			gl.x = x
+		}
+		gl.present = true
+		layouts = append(layouts, gl)
+
+		width := g.MBB.Max[0] - g.MBB.Min[0]
+		height := g.MBB.Max[1] - g.MBB.Min[1]
 		mbb := MBB{
-			Min: Pt{minx, miny},
-			Max: Pt{minx + width, miny + height},
+			Min: Pt{x + g.MBB.Min[0], y + g.MBB.Min[1]},
+			Max: Pt{x + g.MBB.Min[0] + width, y + g.MBB.Min[1] + height},
 		}
 		dx := g.HorizAdvX
 		if dx == 0 {
 			dx = font.HorizAdvX
 		}
 		x += dx
-		// log.Printf("Glyph %+q: mbb=%v, x=%v", g.Unicode, mbb, x)
+		prevRune = c
 		if result == nil {
 			result = &mbb
 		} else {
@@ -188,26 +244,34 @@ func TextMBB(xPos, yPos, xScale, yScale float64, message, fontName string) (*MBB
 	}
 
 	if result == nil {
-		return nil, errors.New("message must not be empty")
+		return nil, nil, errors.New("message must not be empty")
+	}
+	return layouts, result, nil
+}
+
+func textMBB(xPos, yPos, xScale, yScale float64, message, fontName string, useKerning bool) (*MBB, error) {
+	font, err := getFont(fontName)
+	if err != nil {
+		return nil, err
 	}
 
-	// log.Printf("TextMBB: xScale,yScale=(%v,%v)", xScale, yScale)
-	fsf := 1.0 / font.UnitsPerEm
-	xScale *= fsf
-	yScale *= fsf
-	// log.Printf("TextMBB: UnitsPerEm=%v, fsf=%v, scale=(%v,%v), xPos,yPos=(%v,%v)", font.UnitsPerEm, fsf, xScale, yScale, xPos, yPos)
+	_, nativeMBB, err := layoutText(font, message, useKerning)
+	if err != nil {
+		return nil, err
+	}
 
-	minx := xPos + xScale*result.Min[0]
-	miny := yPos + yScale*result.Min[1]
-	width := xScale * (result.Max[0] - result.Min[0])
-	height := yScale * (result.Max[1] - result.Min[1])
-	mbb := &MBB{
+	fsf := 1.0 / font.UnitsPerEm
+	xs := xScale * fsf
+	ys := yScale * fsf
+
+	minx := xPos + xs*nativeMBB.Min[0]
+	miny := yPos + ys*nativeMBB.Min[1]
+	width := xs * (nativeMBB.Max[0] - nativeMBB.Min[0])
+	height := ys * (nativeMBB.Max[1] - nativeMBB.Min[1])
+	return &MBB{
 		Min: Pt{minx, miny},
 		Max: Pt{minx + width, miny + height},
-	}
-
-	// log.Printf("TextMBB: message=%q, result=%v, mbb=%v", message, result, mbb)
-	return mbb, nil
+	}, nil
 }
 
 // Text returns a Render representing the rendered text.
@@ -216,28 +280,52 @@ func TextMBB(xPos, yPos, xScale, yScale float64, message, fontName string) (*MBB
 //
 // xScale and yScale are provided to convert the font to any scale desired
 // (or mirror the font with negative values).
+//
+// Kerning is only applied when opts is non-nil and has EnableKerning
+// set; the default (and a nil opts) preserves the historical
+// advance-width-only behavior. See TextKern for the explicit variant.
 func Text(xPos, yPos, xScale, yScale float64, message, fontName string, opts *TextOpts) (*Render, error) {
+	useKerning := opts != nil && opts.EnableKerning
+	return text(xPos, yPos, xScale, yScale, message, fontName, opts, useKerning)
+}
+
+// TextKern returns a Render representing the rendered text, optionally
+// applying the font's horizontal kerning table.
+//
+// When useKerning is false, it is identical to Text with the same
+// opts. When true (and the font carries kerning data), each glyph's
+// base position is shifted by the kerning adjustment of the
+// preceding present-glyph pair; the polygon outlines of the glyphs
+// themselves are unchanged. Fonts without a kerning table render
+// exactly as before.
+//
+// All dimensions are in "em"s. xScale and yScale convert the font to
+// any scale desired (or mirror it with negative values) and must be
+// finite.
+func TextKern(xPos, yPos, xScale, yScale float64, message, fontName string, opts *TextOpts, useKerning bool) (*Render, error) {
+	if !finite(xPos) || !finite(yPos) || !finite(xScale) || !finite(yScale) {
+		return nil, errors.New("xPos, yPos, xScale and yScale must be finite")
+	}
+	return text(xPos, yPos, xScale, yScale, message, fontName, opts, useKerning)
+}
+
+func text(xPos, yPos, xScale, yScale float64, message, fontName string, opts *TextOpts, useKerning bool) (*Render, error) {
 	font, err := getFont(fontName)
 	if err != nil {
 		return nil, err
 	}
 
-	mbb, err := TextMBB(xPos, yPos, xScale, yScale, message, fontName)
+	// Single layout walk: advances and kerning adjustments are
+	// computed here once and reused for alignment, the MBB and every
+	// glyph base below.
+	layouts, nativeMBB, err := layoutText(font, message, useKerning)
 	if err != nil {
 		return nil, err
 	}
 
-	if font.HorizAdvX == 0 {
-		font.HorizAdvX = font.UnitsPerEm
-	}
-	if font.MissingHorizAdvX == 0 {
-		font.MissingHorizAdvX = font.HorizAdvX
-	}
-
-	x, y := xPos, yPos
 	fsf := 1.0 / font.UnitsPerEm
-	xScale *= fsf
-	yScale *= fsf
+	xs := xScale * fsf
+	ys := yScale * fsf
 	var xAlign float64
 	var yAlign float64
 	if opts != nil {
@@ -245,14 +333,16 @@ func Text(xPos, yPos, xScale, yScale float64, message, fontName string, opts *Te
 		yAlign = opts.YAlign
 	}
 
-	width := (mbb.Max[0] - mbb.Min[0])
-	height := (mbb.Max[1] - mbb.Min[1])
-	xError := mbb.Min[0] - xPos
-	yError := mbb.Min[1] - yPos
-	xPos = xPos - xAlign*width - xError
-	yPos = yPos - yAlign*height - yError
-	x, y = xPos, yPos
-	// log.Printf("Text: TextMBB=%v, Pos=(%v,%v), error=(%v,%v), x,y=(%v,%v)", mbb, xPos, yPos, xError, yError, x, y)
+	// Align the (already kerned) native MBB to the anchor point,
+	// matching the historical Text convention.
+	width := xs * (nativeMBB.Max[0] - nativeMBB.Min[0])
+	height := ys * (nativeMBB.Max[1] - nativeMBB.Min[1])
+	scaledMinX := xPos + xs*nativeMBB.Min[0]
+	scaledMinY := yPos + ys*nativeMBB.Min[1]
+	xError := scaledMinX - xPos
+	yError := scaledMinY - yPos
+	anchorX := xPos - xAlign*width - xError
+	anchorY := yPos - yAlign*height - yError
 
 	var xformPt func(pt Pt) Pt
 	if opts == nil || opts.Rotate == 0.0 {
@@ -263,14 +353,21 @@ func Text(xPos, yPos, xScale, yScale float64, message, fontName string, opts *Te
 		cos := math.Cos(opts.Rotate)
 		sin := math.Sin(opts.Rotate)
 		xformPt = func(pt Pt) Pt {
-			dx := pt[0] - xPos
-			dy := pt[1] - yPos
-			return Pt{xPos + dx*cos - dy*sin, yPos + dy*cos + dx*sin}
+			dx := pt[0] - anchorX
+			dy := pt[1] - anchorY
+			return Pt{anchorX + dx*cos - dy*sin, anchorY + dy*cos + dx*sin}
 		}
 	}
 
 	result := &Render{}
-	for runeIndex, c := range message {
+	for _, gl := range layouts {
+		c := gl.r
+		// Native-unit pen position mapped through scale and the
+		// aligned anchor: the first glyph's native pen is (0,0),
+		// so the first base lands exactly on (anchorX, anchorY).
+		x := anchorX + xs*gl.x
+		y := anchorY + ys*gl.y
+
 		newPt := xformPt(Pt{x, y})
 		gi := &GlyphInfo{
 			Glyph: c,
@@ -280,26 +377,16 @@ func Text(xPos, yPos, xScale, yScale float64, message, fontName string, opts *Te
 		}
 		result.Info = append(result.Info, gi)
 
-		if c == rune('\n') {
-			x, y = xPos, y-yScale*(font.Ascent-font.Descent)
+		if !gl.present {
+			// Newlines, tabs and missing glyphs carry no polygons;
+			// their base position is recorded above for reference.
 			continue
 		}
-		if c == rune('\t') {
-			x += 2.0 * xScale * font.HorizAdvX
-			continue
-		}
-		g, ok := font.Glyphs[c]
-		if !ok {
-			if c != ' ' {
-				log.Printf("Warning: missing glyph %+q: skipping", c)
-			}
-			x += xScale * font.MissingHorizAdvX
-			continue
-		}
-		dx, r := g.Render(x, y, xScale, yScale)
+		g := font.Glyphs[c]
+		dx, r := g.Render(x, y, xs, ys)
 		gi.N = len(r.Polygons)
 		for pi, poly := range r.Polygons {
-			poly.RuneIndex = runeIndex
+			poly.RuneIndex = gl.runeIndex
 			for i, pt := range poly.Pts {
 				newPt := xformPt(pt)
 				v := MBB{Min: newPt, Max: newPt}
@@ -327,11 +414,8 @@ func Text(xPos, yPos, xScale, yScale float64, message, fontName string, opts *Te
 		if dx == 0 {
 			dx = font.HorizAdvX
 		}
-		width := dx * xScale
-		gi.Width = width
-		x += width
+		gi.Width = dx * xs
 	}
-	// log.Printf("FINAL MBB=%v", result.MBB)
 	return result, nil
 }
 
@@ -608,4 +692,9 @@ func FillBox(mbb MBB, xScale, yScale float64, message, fontName string, opts *Te
 
 func lerp(t, a, b float64) float64 {
 	return (1.0-t)*a + t*b
+}
+
+// finite reports whether v is a finite, non-NaN floating point value.
+func finite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }

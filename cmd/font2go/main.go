@@ -18,6 +18,7 @@ import (
 	"text/template"
 	"unicode/utf8"
 
+	"github.com/gmlewis/go-fonts/fonts"
 	"github.com/gmlewis/go-fonts/pb/glyphs"
 	"github.com/gmlewis/go-fonts/webfont"
 	"google.golang.org/protobuf/proto"
@@ -146,6 +147,12 @@ func writeFont(fontData *webfont.FontData, fontDir string) {
 		}
 		fontData.Font.Data = base64.StdEncoding.EncodeToString(b.Bytes())
 	}
+
+	// Expand the SVG <hkern> elements into a rune-pair table and
+	// serialize it alongside the glyph payload. A font without
+	// kerning data produces an empty string and an empty init call.
+	kernFont := &fonts.Font{Kern: webfont.ExpandHKerns(fontData.Font.HKerns, fontData.Font.Glyphs)}
+	fontData.Font.KernData = kernFont.EncodeKern()
 
 	var buf bytes.Buffer
 	if err := outTemp.Execute(&buf, fontData.Font); err != nil {
@@ -290,12 +297,18 @@ var {{ .ID }}Font = &fonts.Font{
 	Descent:    {{ .FontFace.Descent }},
 	MissingHorizAdvX: {{ .MissingGlyph.HorizAdvX }},
 	Glyphs:           map[rune]*fonts.Glyph{},
+	Kern:             map[[2]rune]float64{},
 }
 
 func init() {
 	fonts.Fonts["{{ .ID }}"] = {{ .ID }}Font
 	fonts.InitFromFontData({{ .ID }}Font, fontData)
+	if err := {{ .ID }}Font.DecodeKern(kernData); err != nil {
+		panic(err)
+	}
 }
 
-var fontData = ` + "`{{ .Data }}`" + ` 
+var fontData = ` + "`{{ .Data }}`" + `
+
+var kernData = ` + "`{{ .KernData }}`" + `
 `

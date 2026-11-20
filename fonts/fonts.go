@@ -59,6 +59,18 @@ type Font struct {
 	MissingHorizAdvX float64
 	// Glyphs is a map of the available glyphs, mapped by rune.
 	Glyphs map[rune]*Glyph
+	// Kern holds the horizontal kerning table of the font, keyed by
+	// an ordered pair of runes (left glyph, right glyph) and valued
+	// in native font units. A negative adjustment moves the right
+	// glyph closer to the left one; a positive one moves it apart.
+	//
+	// A nil or empty table means that the font has no kerning data
+	// and layout falls back to the per-glyph advance widths. The
+	// table is only consulted by the kerning-aware entry points
+	// (TextKern, TextMBBKern and Text with TextOpts.EnableKerning);
+	// the legacy Text and TextMBB functions keep their exact
+	// previous behavior.
+	Kern map[[2]rune]float64
 }
 
 // Glyph represents an individual character of the webfont data.
